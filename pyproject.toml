@@ -1,0 +1,19 @@
+[project]
+name = "feature-model"
+version = "0.1.0"
+description = "Mobile-cable three-modality feature fusion and fixed-weight risk service"
+requires-python = ">=3.11"
+dependencies = [
+    "einops>=0.8",
+    "fastapi>=0.115",
+    "h5py>=3.11",
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "pillow>=11.0",
+    "pyarrow>=18.0",
+    "pyxtf==1.5.0",
+    "scikit-learn>=1.6",
+    "scipy>=1.14",
+    "torch>=2.6",
+    "uvicorn>=0.34",
+]
