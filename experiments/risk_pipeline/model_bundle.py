@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 from pathlib import Path
 import threading
 from typing import Any
@@ -19,10 +20,11 @@ from risk_pipeline.sensor_imputation import (
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_FUSION_CHECKPOINT = (
     ROOT
-    / "outputs"
-    / "feature_fusion_transformer_production"
+    / "models"
+    / "feature_fusion_transformer"
     / "feature_fusion_transformer.pt"
 )
+logger = logging.getLogger("f-model.models")
 
 
 def resolve_inference_device(device: str | torch.device) -> torch.device:
@@ -57,14 +59,28 @@ class ProductionModelBundle:
         resolved_device = resolve_inference_device(device)
         sensor_path = Path(sensor_checkpoint_path).resolve()
         fusion_path = Path(fusion_checkpoint_path).resolve()
+        logger.info(
+            "Loading inference models: sensor_checkpoint=%s fusion_checkpoint=%s device=%s",
+            sensor_path, fusion_path, resolved_device,
+        )
         sensor_model, sensor_checkpoint = load_sensor_imputeformer_checkpoint(
             sensor_path,
             resolved_device,
+        )
+        logger.info(
+            "Sensor model configuration: format=%s time_aware=%s static_sensor_embedding=%s "
+            "neural_residual_enabled=%s visible_median_calibration=%s",
+            sensor_checkpoint.get("format_version"),
+            sensor_checkpoint["model_config"].get("time_aware", False),
+            sensor_checkpoint["model_config"].get("static_sensor_embedding", False),
+            bool(getattr(sensor_model, "context_residual_gain", torch.ones(1)).any()),
+            sensor_checkpoint["model_config"].get("visible_median_calibration", False),
         )
         fusion_model, fusion_checkpoint = load_feature_fusion_checkpoint(
             fusion_path,
             map_location=resolved_device,
         )
+        logger.info("Inference models loaded and ready on %s", resolved_device)
         return cls(
             sensor_model=sensor_model,
             sensor_checkpoint=sensor_checkpoint,

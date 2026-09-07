@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -14,16 +15,18 @@ from torch.utils.data import DataLoader, Dataset
 from imputeformer.models import ImputeFormerModel
 
 from .sensor_schema import OCEAN_SENSOR_IDS
+from .temporal_context import RAW_TEMPORAL_FEATURE_NAMES, raw_temporal_features, timestamp_nanoseconds
 
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SENSOR_CHECKPOINT = (
     ROOT
-    / "outputs"
-    / "sensor_imputeformer_production"
+    / "models"
+    / "sensor_imputeformer"
     / "imputeformer_ocean_five_sensor.pt"
 )
 EXPECTED_SENSOR_IDS = OCEAN_SENSOR_IDS
+LOGGER = logging.getLogger(__name__)
 
 
 def sha256_file(path: Path) -> str:
@@ -47,6 +50,12 @@ def _build_model(config: Mapping[str, object]) -> ImputeFormerModel:
         dropout=float(config["dropout"]),
         windows=int(config["window"]),
         dim_proj=int(config["dim_proj"]),
+        variable_length=bool(config.get("variable_length", False)),
+        use_interpolation_residual=bool(config.get("use_interpolation_residual", False)),
+        time_aware=bool(config.get("time_aware", False)),
+        static_sensor_embedding=bool(config.get("static_sensor_embedding", False)),
+        visible_median_calibration=bool(config.get("visible_median_calibration", False)),
+        no_context_prior=config.get("no_context_prior"),
     )
 
 
@@ -82,23 +91,30 @@ def load_sensor_imputeformer_checkpoint(
     if int(config.get("num_nodes", -1)) != len(EXPECTED_SENSOR_IDS):
         raise ValueError("Sensor checkpoint num_nodes is not five.")
     temporal_feature_names = checkpoint.get("temporal_feature_names")
-    if temporal_feature_names != [
+    expected_temporal_names = RAW_TEMPORAL_FEATURE_NAMES if config.get("time_aware") else [
         "second_of_day_sin",
         "second_of_day_cos",
         "day_of_year_sin",
         "day_of_year_cos",
         "log_sampling_interval",
-    ]:
+    ]
+    if temporal_feature_names != expected_temporal_names:
         raise ValueError("Sensor checkpoint temporal feature schema is invalid.")
-    if int(config.get("input_dim", -1)) != 6 or int(config.get("output_dim", -1)) != 1:
+    expected_input_dim = 13 if config.get("time_aware") else 6
+    if int(config.get("input_dim", -1)) != expected_input_dim or int(config.get("output_dim", -1)) != 1:
         raise ValueError("Sensor checkpoint input/output dimensions are invalid.")
 
     supported = checkpoint.get("supported_sampling_interval_seconds")
     if not isinstance(supported, Mapping):
         raise ValueError("Sensor checkpoint has no sampling interval contract.")
-    minimum = float(supported.get("minimum", float("nan")))
-    maximum = float(supported.get("maximum", float("nan")))
-    if not np.isfinite([minimum, maximum]).all() or not 0 < minimum <= maximum:
+    minimum = float(supported.get("minimum", 0.0))
+    maximum = supported.get("maximum")
+    if not np.isfinite(minimum) or minimum < 0 or (
+        maximum is not None and (
+            not np.isfinite(float(maximum)) or float(maximum) <= 0
+            or minimum > float(maximum)
+        )
+    ):
         raise ValueError("Sensor checkpoint sampling interval contract is invalid.")
 
     normalization = checkpoint.get("normalization")
@@ -164,15 +180,17 @@ def apply_checkpoint_output_calibration(
     return calibrated
 
 
-def _validate_regular_index(index: pd.DatetimeIndex) -> float:
+def _validate_regular_index(index: pd.DatetimeIndex) -> float | None:
     if not isinstance(index, pd.DatetimeIndex):
         raise ValueError("Sensor input must use a DatetimeIndex.")
     if index.tz is None:
         raise ValueError("Sensor timestamps must include a timezone.")
-    if index.has_duplicates or not index.is_monotonic_increasing:
+    if index.hasnans or index.has_duplicates or not index.is_monotonic_increasing:
         raise ValueError("Sensor timestamps must be unique and chronological.")
-    if len(index) < 2:
-        raise ValueError("Sensor input needs at least two timestamps.")
+    if not len(index):
+        raise ValueError("Sensor input needs at least one timestamp.")
+    if len(index) == 1:
+        return None
     timestamps_ns = index.to_numpy(dtype="datetime64[ns]").astype(
         "int64", copy=False
     )
@@ -184,8 +202,9 @@ def _validate_regular_index(index: pd.DatetimeIndex) -> float:
 
 def temporal_features(
     index: pd.DatetimeIndex,
-    sampling_interval_seconds: float,
-    maximum_supported_seconds: float,
+    sampling_interval_seconds: float | None,
+    maximum_supported_seconds: float | None = None,
+    encoding: str = "bounded_log_interval_v1",
 ) -> np.ndarray:
     second_of_day = (
         index.hour.to_numpy() * 3600
@@ -199,11 +218,21 @@ def temporal_features(
         + second_of_day / 86_400.0
     )
     seasonal_phase = 2.0 * np.pi * fractional_day_of_year / 365.2425
-    interval_feature = np.full(
-        len(index),
-        np.log1p(sampling_interval_seconds) / np.log1p(maximum_supported_seconds),
-        dtype="float64",
-    )
+    if sampling_interval_seconds is None:
+        interval_value = 0.0
+    else:
+        if not np.isfinite(sampling_interval_seconds) or sampling_interval_seconds <= 0:
+            raise ValueError("Sampling interval must be a finite positive duration.")
+        log_interval = np.log1p(sampling_interval_seconds)
+        if encoding == "bounded_log_interval_v1":
+            interval_value = log_interval / (1.0 + log_interval)
+        elif encoding == "legacy_maximum_log_interval":
+            if maximum_supported_seconds is None or maximum_supported_seconds <= 0:
+                raise ValueError("Legacy temporal encoding requires a positive scale.")
+            interval_value = log_interval / np.log1p(maximum_supported_seconds)
+        else:
+            raise ValueError(f"Unknown temporal encoding: {encoding!r}.")
+    interval_feature = np.full(len(index), interval_value, dtype="float64")
     return np.stack(
         [
             np.sin(phase),
@@ -217,10 +246,12 @@ def temporal_features(
 
 
 def _window_starts(length: int, window: int, stride: int) -> list[int]:
-    if length < window:
-        raise ValueError(
-            f"Resampled stream has {length} time steps; checkpoint needs {window}."
-        )
+    if length < 1 or window < 1:
+        raise ValueError("Input length and model window must be positive.")
+    if not 1 <= stride <= window:
+        raise ValueError("Inference stride must be between 1 and model window.")
+    if length <= window:
+        return [0]
     starts = list(range(0, length - window + 1, stride))
     final_start = length - window
     if not starts or starts[-1] != final_start:
@@ -249,15 +280,25 @@ class _InferenceWindowDataset(Dataset):
     def __getitem__(self, index: int):
         start = self.starts[index]
         stop = start + self.window
+        values = self.values[start:stop]
+        temporal = self.temporal[start:stop]
+        observed = self.observed[start:stop]
+        if len(values) < self.window:
+            padding = self.window - len(values)
+            values = np.pad(values, ((0, padding), (0, 0), (0, 0)), mode="edge")
+            temporal = np.pad(temporal, ((0, padding), (0, 0)), mode="edge")
+            observed = np.pad(observed, ((0, padding), (0, 0), (0, 0)))
         return (
-            torch.from_numpy(self.values[start:stop]),
-            torch.from_numpy(self.temporal[start:stop]),
-            torch.from_numpy(self.observed[start:stop]),
+            torch.from_numpy(values),
+            torch.from_numpy(temporal),
+            torch.from_numpy(observed),
             start,
         )
 
 
 def _validate_sensor_columns(columns: Sequence[object]) -> None:
+    if len(columns) != len(set(columns)):
+        raise ValueError("Sensor identifiers must be unique.")
     received = {str(column) for column in columns}
     expected = set(EXPECTED_SENSOR_IDS)
     missing = sorted(expected - received)
@@ -288,10 +329,6 @@ def deterministic_observed_holdout(
         count = min(len(positions) - 1, max(1, int(round(len(positions) * ratio))))
         selected = rng.choice(positions, size=count, replace=False)
         holdout[selected, sensor_index] = True
-    if not holdout.any():
-        raise ValueError(
-            "Alignment evaluation needs at least one sensor with two observed values."
-        )
     return holdout
 
 
@@ -311,6 +348,18 @@ def calculate_alignment_metrics(
         selected = holdout[:, sensor_index]
         errors = prediction_values[selected, sensor_index] - truth_values[selected, sensor_index]
         if not len(errors):
+            rows.append({
+                "scope": "sensor",
+                "sensor_id": sensor_id,
+                "value_space": "physical_sensor_unit",
+                "evaluation_method": "deterministic_holdout_of_observed_input",
+                "requested_holdout_ratio": holdout_ratio,
+                "evaluated_values": 0,
+                "status": "insufficient_observed_values",
+                "MAE": None,
+                "MSE": None,
+                "RMSE": None,
+            })
             continue
         squared = np.square(errors)
         rows.append({
@@ -325,6 +374,19 @@ def calculate_alignment_metrics(
             "RMSE": float(np.sqrt(np.mean(squared))),
         })
         normalized_errors.append(errors / float(sensor_std[sensor_index]))
+    if not normalized_errors:
+        return [{
+            "scope": "overall",
+            "sensor_id": "all_five_sensors",
+            "value_space": "checkpoint_normalized",
+            "evaluation_method": "deterministic_holdout_of_observed_input",
+            "requested_holdout_ratio": holdout_ratio,
+            "evaluated_values": 0,
+            "status": "insufficient_observed_values",
+            "MAE": None,
+            "MSE": None,
+            "RMSE": None,
+        }, *rows]
     all_normalized = np.concatenate(normalized_errors)
     squared = np.square(all_normalized)
     rows.insert(0, {
@@ -343,7 +405,7 @@ def calculate_alignment_metrics(
 
 def _infer_with_loaded_imputeformer(
     ordered: pd.DataFrame,
-    sampling_interval_seconds: float,
+    sampling_interval_seconds: float | None,
     model: ImputeFormerModel,
     checkpoint: Mapping[str, object],
     resolved_device: torch.device,
@@ -351,10 +413,12 @@ def _infer_with_loaded_imputeformer(
 ) -> pd.DataFrame:
     """Run one forward-only pass with an already loaded checkpoint."""
     supported = checkpoint["supported_sampling_interval_seconds"]
-    maximum_interval = float(supported["maximum"])
+    maximum_interval = supported.get("maximum")
     config = checkpoint["model_config"]
     window = int(config["window"])
     stride = int(config.get("inference_stride", window))
+    starts = _window_starts(len(ordered), window, stride)
+    inference_window = min(window, len(ordered)) if config.get("variable_length") else window
     mean = np.asarray(checkpoint["normalization"]["mean"], dtype="float32")
     std = np.asarray(checkpoint["normalization"]["std"], dtype="float32")
     raw_values = ordered.to_numpy(dtype="float64")
@@ -363,19 +427,23 @@ def _infer_with_loaded_imputeformer(
         mean,
         std,
     )
-    time_values = temporal_features(
+    time_values = raw_temporal_features(ordered.index) if config.get("time_aware") else temporal_features(
         ordered.index,
         sampling_interval_seconds,
         maximum_interval,
+        encoding=str(checkpoint.get("temporal_encoding", "legacy_maximum_log_interval")),
     )
-    starts = _window_starts(len(ordered), window, stride)
+    if config.get("time_aware"):
+        global_baseline, global_context = _visible_time_baseline(
+            raw_values, observed[:, :, 0], time_values[:, 0], mean,
+        )
     loader = DataLoader(
         _InferenceWindowDataset(
             normalized,
             time_values,
             observed,
             starts,
-            window,
+            inference_window,
         ),
         batch_size=batch_size,
         shuffle=False,
@@ -386,6 +454,20 @@ def _infer_with_loaded_imputeformer(
 
     sums = np.zeros_like(raw_values, dtype="float64")
     counts = np.zeros_like(raw_values, dtype="float64")
+    best_context = np.full(raw_values.shape, -1, dtype="int8")
+    LOGGER.info(
+        "ImputeFormer inference: rows=%d, model_window=%d, effective_window=%d, "
+        "windows=%d, stride=%d, interval_seconds=%s, device=%s",
+        len(ordered), window, inference_window, len(starts), stride,
+        sampling_interval_seconds, resolved_device,
+    )
+    if config.get("time_aware"):
+        LOGGER.info(
+            "Time-aware estimation: neural_residual_gains=%s visible_median_gains=%s no_context_prior=%s",
+            getattr(model, "context_residual_gain", torch.empty(0)).detach().cpu().tolist(),
+            getattr(model, "context_median_gain", torch.empty(0)).detach().cpu().tolist(),
+            config.get("no_context_prior"),
+        )
     with torch.inference_mode():
         for x, temporal, mask, batch_starts in loader:
             prediction = model(
@@ -399,8 +481,32 @@ def _infer_with_loaded_imputeformer(
             )[..., 0]
             prediction = prediction * std[None, None, :] + mean[None, None, :]
             for local_index, start in enumerate(batch_starts.tolist()):
-                sums[start : start + window] += prediction[local_index]
-                counts[start : start + window] += 1
+                stop = min(start + inference_window, len(ordered))
+                window_observed = observed[start:stop, :, 0]
+                left_context = np.logical_or.accumulate(window_observed, axis=0)
+                right_context = np.logical_or.accumulate(window_observed[::-1], axis=0)[::-1]
+                context = left_context.astype("int8") + right_context.astype("int8")
+                previous_context = best_context[start:stop]
+                replace = context > previous_context
+                equal = context == previous_context
+                window_prediction = prediction[local_index, :stop - start]
+                if config.get("time_aware"):
+                    local_baseline, _ = _visible_time_baseline(
+                        raw_values[start:stop], window_observed,
+                        time_values[start:stop, 0], mean,
+                    )
+                    # Preserve distant visible endpoints across long sensor outages.
+                    # Residuals require the same directional context as the full input.
+                    residual = window_prediction - local_baseline
+                    residual = np.where(context == global_context[start:stop], residual, 0.0)
+                    window_prediction = global_baseline[start:stop] + residual
+                window_sums, window_counts = sums[start:stop], counts[start:stop]
+                # Prefer windows with observations on both sides of a gap.
+                window_sums[replace] = window_prediction[replace]
+                window_counts[replace] = 1
+                previous_context[replace] = context[replace]
+                window_sums[equal] += window_prediction[equal]
+                window_counts[equal] += 1
     if not (counts > 0).all():
         raise RuntimeError("ImputeFormer inference left uncovered timestamps.")
     predictions = sums / counts
@@ -414,6 +520,27 @@ def _infer_with_loaded_imputeformer(
     )
 
 
+def _visible_time_baseline(
+    values: np.ndarray,
+    observed: np.ndarray,
+    elapsed_seconds: np.ndarray,
+    fallback: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Interpolate only visible values in physical time, retaining distant context."""
+    baseline = np.empty_like(values, dtype="float64")
+    elapsed = elapsed_seconds - elapsed_seconds[0]
+    for sensor_index in range(values.shape[1]):
+        visible = observed[:, sensor_index]
+        baseline[:, sensor_index] = (
+            np.interp(elapsed, elapsed[visible], values[visible, sensor_index])
+            if visible.any() else fallback[sensor_index]
+        )
+    previous = np.logical_or.accumulate(observed, axis=0)
+    following = np.logical_or.accumulate(observed[::-1], axis=0)[::-1]
+    context = previous.astype("int8") + following.astype("int8")
+    return baseline, context
+
+
 def align_with_pretrained_imputeformer(
     wide_df: pd.DataFrame,
     checkpoint_path: str | Path = DEFAULT_SENSOR_CHECKPOINT,
@@ -425,13 +552,26 @@ def align_with_pretrained_imputeformer(
     preloaded_checkpoint: Mapping[str, object] | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """Fill gaps with the trained model while preserving every observed value."""
+    if batch_size < 1:
+        raise ValueError("Inference batch_size must be positive.")
     _validate_sensor_columns(wide_df.columns)
-    sampling_interval_seconds = _validate_regular_index(wide_df.index)
+    timestamps_ns = timestamp_nanoseconds(wide_df.index)
+    actual_intervals = np.diff(timestamps_ns).astype("float64") / 1e9
+    sampling_interval_seconds = float(np.median(actual_intervals)) if len(actual_intervals) else None
+    if sampling_interval_seconds is None:
+        sampling_interval_seconds = wide_df.attrs.get("sampling_interval_seconds")
     ordered = wide_df.loc[:, EXPECTED_SENSOR_IDS].copy()
     for sensor_id in EXPECTED_SENSOR_IDS:
-        ordered[sensor_id] = pd.to_numeric(ordered[sensor_id], errors="coerce")
-        if ordered[sensor_id].notna().sum() == 0:
-            raise ValueError(f"Sensor '{sensor_id}' has no observed values.")
+        ordered[sensor_id] = pd.to_numeric(ordered[sensor_id], errors="coerce").replace(
+            [np.inf, -np.inf], np.nan
+        )
+    no_observed_sensor_ids = [
+        sensor_id for sensor_id in EXPECTED_SENSOR_IDS if ordered[sensor_id].isna().all()
+    ]
+    if len(no_observed_sensor_ids) == len(EXPECTED_SENSOR_IDS):
+        raise ValueError("At least one finite sensor observation is required.")
+    if no_observed_sensor_ids:
+        LOGGER.info("ImputeFormer sensors without observed input: %s", no_observed_sensor_ids)
 
     if (preloaded_model is None) != (preloaded_checkpoint is None):
         raise ValueError(
@@ -454,15 +594,9 @@ def align_with_pretrained_imputeformer(
         checkpoint = preloaded_checkpoint
         resolved_device = next(model.parameters()).device
     supported = checkpoint["supported_sampling_interval_seconds"]
-    minimum_interval = float(supported["minimum"])
-    maximum_interval = float(supported["maximum"])
-    if not minimum_interval <= sampling_interval_seconds <= maximum_interval:
-        raise ValueError(
-            "Aligned sensor interval is outside the checkpoint contract: "
-            f"got {sampling_interval_seconds:g}s, supported "
-            f"[{minimum_interval:g}s, {maximum_interval:g}s]."
-        )
     config = checkpoint["model_config"]
+    if not config.get("time_aware"):
+        _validate_regular_index(wide_df.index)
     window = int(config["window"])
     stride = int(config.get("inference_stride", window))
     std = np.asarray(checkpoint["normalization"]["std"], dtype="float32")
@@ -487,12 +621,28 @@ def align_with_pretrained_imputeformer(
         "input_rows": len(ordered),
         "window": window,
         "inference_stride": stride,
+        "inference_windows": len(_window_starts(len(ordered), window, stride)),
+        "arbitrary_input_length": True,
+        "window_fusion": (
+            "global_visible_time_baseline_with_context_matched_residual_mean"
+            if config.get("time_aware") else "observed_context_priority_mean"
+        ),
+        "short_sequence_strategy": (
+            "native_variable_length" if config.get("variable_length") else "masked_padding"
+        ),
         "sampling_interval_seconds": sampling_interval_seconds,
+        "temporal_input": "actual_elapsed_and_delta_seconds" if config.get("time_aware") else "legacy_grid_covariates",
+        "actual_interval_seconds_min": float(actual_intervals.min()) if len(actual_intervals) else None,
+        "actual_interval_seconds_max": float(actual_intervals.max()) if len(actual_intervals) else None,
         "supported_sampling_interval_seconds": supported,
         "input_observed_values": int(np.isfinite(raw_values).sum()),
+        "no_observed_sensor_ids": no_observed_sensor_ids,
         "imputed_values": int(np.isnan(raw_values).sum()),
         "device": str(resolved_device),
         "output_calibration_applied": checkpoint.get("output_calibration") is not None,
+        "visible_median_calibration_applied": bool(config.get("visible_median_calibration", False)),
+        "neural_residual_enabled": bool(getattr(model, "context_residual_gain", torch.ones(1)).any()),
+        "no_context_prior_normalized": config.get("no_context_prior"),
     }
     if evaluation_holdout_ratio:
         holdout = deterministic_observed_holdout(
@@ -506,7 +656,7 @@ def align_with_pretrained_imputeformer(
             checkpoint,
             resolved_device,
             batch_size,
-        )
+        ) if holdout.any() else ordered.copy()
         metadata["evaluation_metrics"] = calculate_alignment_metrics(
             ordered,
             evaluation_prediction,

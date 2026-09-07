@@ -28,6 +28,7 @@ from risk_pipeline.run_encapsulated_pipeline import (  # noqa: E402
     run_transformer_stage,
     validate_risk_checkpoint_binding,
 )
+from risk_pipeline.data_io import load_grayscale_image  # noqa: E402
 from train_feature_fusion_transformer import (  # noqa: E402
     FeatureSplit,
     construct_pair_indices,
@@ -37,11 +38,47 @@ from train_feature_fusion_transformer import (  # noqa: E402
 
 
 class FeatureFusionTests(unittest.TestCase):
-    def _checkpoint(self, path, normalization_shift=0.0):
+    def test_grayscale_loader_preserves_16_bit_png_and_tiff_intensities(self):
+        pixels = np.asarray([[1000, 2000], [3000, 4000]], dtype="uint16")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for suffix in (".png", ".tif"):
+                with self.subTest(suffix=suffix):
+                    path = Path(temp_dir) / f"sonar{suffix}"
+                    Image.fromarray(pixels).save(path)
+                    loaded = load_grayscale_image(path)
+                    self.assertEqual(loaded.dtype, np.dtype("float32"))
+                    self.assertEqual(loaded.shape, pixels.shape)
+                    np.testing.assert_allclose(loaded, pixels.astype("float32") / 65535.0)
+                    self.assertGreater(float(loaded.std()), 0.0)
+                    Image.fromarray(np.full((2, 2), 1000, dtype="uint16")).save(path)
+                    np.testing.assert_allclose(load_grayscale_image(path), 1000 / 65535.0)
+
+    def test_grayscale_loader_has_explicit_float_and_signed_integer_ranges(self):
+        cases = (
+            (np.asarray([[0.1, 0.3], [0.7, 0.9]], dtype="float32"),
+             np.asarray([[0.1, 0.3], [0.7, 0.9]], dtype="float32")),
+            (np.asarray([[-1.0, 0.0], [1.0, 3.0]], dtype="float32"),
+             np.asarray([[0.0, 0.25], [0.5, 1.0]], dtype="float32")),
+            (np.full((2, 2), 1000.0, dtype="float32"), np.ones((2, 2))),
+            (np.full((2, 2), -10.0, dtype="float32"), np.zeros((2, 2))),
+            (np.asarray([[-1, 0], [1000, 2000]], dtype="int32"),
+             np.asarray([[0, 0], [1000, 2000]], dtype="float32") / np.iinfo("int32").max),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "sonar.tif"
+            for pixels, expected in cases:
+                with self.subTest(dtype=pixels.dtype, minimum=float(pixels.min())):
+                    Image.fromarray(pixels).save(path)
+                    np.testing.assert_allclose(load_grayscale_image(path), expected)
+            Image.fromarray(np.full((2, 2), np.nan, dtype="float32")).save(path)
+            with self.assertRaisesRegex(ValueError, "non-finite"):
+                load_grayscale_image(path)
+
+    def _checkpoint(self, path, normalization_shift=0.0, d_model=32):
         torch.manual_seed(7)
         config = {
             "input_dims": feature_input_dims(),
-            "d_model": 32,
+            "d_model": d_model,
             "num_heads": 4,
             "num_layers": 1,
             "ff_dim": 64,
@@ -263,11 +300,11 @@ class FeatureFusionTests(unittest.TestCase):
         for name in ("mae", "mse", "rmse", "mre"):
             self.assertIn(f"overall_unified_{name}", baseline)
 
-    def test_end_to_end_writes_one_json_risk_result_and_no_risk_csv(self):
+    def test_end_to_end_retains_only_requested_artifacts_and_logs_features(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             checkpoint_path = root / "fusion.pt"
-            self._checkpoint(checkpoint_path)
+            self._checkpoint(checkpoint_path, d_model=128)
             checkpoint_hash = hashlib.sha256(
                 checkpoint_path.read_bytes()
             ).hexdigest()
@@ -331,7 +368,7 @@ class FeatureFusionTests(unittest.TestCase):
             with patch(
                 "risk_pipeline.run_encapsulated_pipeline.load_xtf_sonar_image",
                 return_value=(sonar_array, sonar_metadata),
-            ):
+            ), self.assertLogs("f-model.pipeline", level="INFO") as logs:
                 result = run_pipeline(args)
 
             risk_path = Path(result["risk_json_path"])
@@ -341,6 +378,17 @@ class FeatureFusionTests(unittest.TestCase):
                 {"time_series", "optical_image", "sonar_image"},
             )
             self.assertIn("total_risk", payload)
+            self.assertEqual(payload["schema_version"], 2)
+            self.assertEqual(payload["embedding_dimension"], 128)
+            self.assertEqual(payload["second_stage_feature_stage"], "stage3_transformer_unified_embedding")
+            for modality, path in result["artifacts"]["second_stage_features"].items():
+                saved = pd.read_csv(path)
+                expected_columns = [f"z_{index:03d}" for index in range(128)]
+                self.assertEqual(saved.filter(regex=r"^z_\d+$").columns.tolist(), expected_columns)
+                self.assertTrue(np.isfinite(saved[expected_columns].to_numpy()).all())
+                self.assertFalse(set(FUSION_FEATURE_COLUMNS[modality]) & set(saved.columns))
+                source_rows = pd.read_csv(result["artifacts"]["first_stage_features"][modality])
+                self.assertEqual(len(saved), len(source_rows))
             self.assertEqual(
                 payload["fusion_checkpoint_sha256"], checkpoint_hash
             )
@@ -352,26 +400,96 @@ class FeatureFusionTests(unittest.TestCase):
             self.assertFalse(list((output_dir / "risk").glob("*.csv")))
             self.assertFalse((output_dir / "modality_risks").exists())
             self.assertEqual(list(output_dir.rglob("*.json")), [risk_path])
-            self.assertEqual(Path(result["summary_path"]).suffix, ".csv")
-            self.assertTrue(list((output_dir / "decoded").glob(
-                "stage1_xtf_decode_metadata_*.csv"
-            )))
+            self.assertNotIn("summary_path", result)
+            self.assertEqual(
+                {path.name for path in output_dir.iterdir()},
+                {"aligned", "features", "risk"},
+            )
+            feature_paths = sorted((output_dir / "features").glob("*.csv"))
+            self.assertEqual(len(feature_paths), 6)
+            self.assertEqual(len(list(output_dir.rglob("*.*"))), 8)
+            for stage, key in (
+                ("First-stage features", "first_stage_features"),
+                ("Second-stage features", "second_stage_features"),
+            ):
+                for modality, path in result["artifacts"][key].items():
+                    matching = [
+                        record.getMessage() for record in logs.records
+                        if record.getMessage().startswith(
+                            f"{stage} output modality={modality} "
+                        )
+                    ]
+                    self.assertEqual(len(matching), 1)
+                    csv_text = Path(path).read_text(encoding="utf-8-sig")
+                    self.assertEqual(matching[0].split("\n", 1)[1], csv_text)
             for item in payload["modalities"].values():
                 self.assertEqual(
                     set(item["feature_value_summary"]), {"min", "mean", "max"}
                 )
-                self.assertTrue(
-                    (output_dir / item["selected_vector_artifact"]).is_file()
+                self.assertNotIn("selected_vector_artifact", item)
+                self.assertTrue((output_dir / item["source"]).is_file())
+                self.assertEqual(item["source_representation"], "transformer_fused_cls")
+                self.assertEqual(item["risk_cls_token_index"], 0)
+                self.assertEqual(
+                    item["risk_feature_derivation"],
+                    "unified_decoder_then_inverse_normalization_then_selected_feature",
                 )
-            self.assertTrue(list((output_dir / "features").glob(
-                "stage3_concatenated_feature_positions_*.csv"
-            )))
+            original_files = {
+                path.relative_to(output_dir): path.read_bytes()
+                for path in output_dir.rglob("*") if path.is_file()
+            }
             with patch(
                 "risk_pipeline.run_encapsulated_pipeline.load_xtf_sonar_image",
                 return_value=(sonar_array, sonar_metadata),
             ):
                 with self.assertRaisesRegex(FileExistsError, "overwrite"):
                     run_pipeline(args)
+            self.assertEqual(original_files, {
+                path.relative_to(output_dir): path.read_bytes()
+                for path in output_dir.rglob("*") if path.is_file()
+            })
+
+            for suffix in (".tif", ".tiff"):
+                with self.subTest(sonar_image_suffix=suffix):
+                    direct_sonar = root / f"sonar{suffix}"
+                    Image.fromarray(
+                        np.tile(np.arange(144, dtype="uint8"), (80, 1))
+                    ).save(direct_sonar)
+                    image_output = root / f"output_{suffix[1:]}"
+                    image_args = SimpleNamespace(**{
+                        **vars(args),
+                        "sonar_image": str(direct_sonar),
+                        "sonar_xtf": None,
+                        "output_dir": str(image_output),
+                    })
+                    with patch(
+                        "risk_pipeline.run_encapsulated_pipeline.load_xtf_sonar_image"
+                    ) as decoder, self.assertLogs("f-model.pipeline", level="INFO"):
+                        image_result = run_pipeline(image_args)
+                    decoder.assert_not_called()
+                    self.assertEqual(
+                        {path.name for path in image_output.iterdir()},
+                        {"aligned", "features", "risk"},
+                    )
+                    self.assertEqual(len(list(image_output.rglob("*.*"))), 8)
+                    self.assertEqual(len(list((image_output / "features").glob("*.csv"))), 6)
+                    for key in ("first_stage_features", "second_stage_features"):
+                        sonar_features = pd.read_csv(
+                            image_result["artifacts"][key]["sonar_image"]
+                        )
+                        self.assertEqual(sonar_features["source"].unique().tolist(), [direct_sonar.name])
+                        self.assertEqual(sonar_features["input_width"].unique().tolist(), [144])
+                        self.assertEqual(sonar_features["input_height"].unique().tolist(), [80])
+                    image_payload = json.loads(
+                        Path(image_result["risk_json_path"]).read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(set(image_payload["modalities"]), set(FUSION_MODALITIES))
+                    self.assertTrue(np.isfinite(image_payload["total_risk"]))
+            conflicting_args = SimpleNamespace(**{
+                **vars(image_args), "sonar_xtf": str(sonar_path),
+            })
+            with self.assertRaisesRegex(ValueError, "[Oo]nly one|both|[Ee]ither"):
+                run_pipeline(conflicting_args)
 
 
 if __name__ == "__main__":

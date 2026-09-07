@@ -1,8 +1,7 @@
-"""Train and qualify ImputeFormer on five second-level ocean sensor streams.
+"""Fresh adaptive ImputeFormer training entry point and shared sensor utilities.
 
-The workflow is sensor-only: select on train/validation data, compare against
-baselines with shared independent-test masks, publish only after qualification,
-then refit on the complete timeline and retain an aligned Parquet artifact.
+The default workflow uses sampled variable-length windows and chronological
+validation/test splits. Historical training helpers remain importable.
 """
 
 from __future__ import annotations
@@ -31,8 +30,9 @@ from risk_pipeline.sensor_schema import OCEAN_SENSOR_IDS, OCEAN_SENSOR_UNITS
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DATASET_ROOT = ROOT / "data" / "ocean_time_series_matanzas_18_second"
+DEFAULT_DATASET_ROOT = ROOT / "data" / "ocean_adaptive_v2"
 DEFAULT_OUTPUT_ROOT = ROOT / "outputs" / "sensor_imputeformer_production"
+DEFAULT_MODEL_ROOT = ROOT / "models" / "sensor_imputeformer"
 SENSOR_COLUMNS = OCEAN_SENSOR_IDS
 SENSOR_UNITS = OCEAN_SENSOR_UNITS
 TEMPORAL_FEATURE_NAMES = (
@@ -117,7 +117,7 @@ def _read_split(path: Path) -> pd.DataFrame:
             "Site, station, deployment, latitude, longitude, and coordinate fields "
             "are not model inputs."
         )
-    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="raise")
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], format="mixed", utc=True, errors="raise")
     if frame["timestamp"].duplicated().any():
         raise ValueError(f"{path} contains duplicate timestamps.")
     if not frame["timestamp"].is_monotonic_increasing:
@@ -145,6 +145,7 @@ def _regular_interval_seconds(index: pd.DatetimeIndex) -> float:
 def load_ocean_sensor_splits(
     dataset_root: Path,
     dataset_run: Path | None = None,
+    require_regular: bool = True,
 ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, object], Path]:
     """Load immutable chronological splits with the exact sensor-only schema."""
     run_dir = Path(dataset_run).resolve() if dataset_run else _latest_dataset_run(
@@ -174,12 +175,13 @@ def load_ocean_sensor_splits(
     ):
         raise ValueError("Train, validation, and test time ranges overlap.")
     combined = pd.concat(splits.values())
-    interval_seconds = _regular_interval_seconds(combined.index)
-    declared_interval = float(
-        manifest.get("grid_audit", {}).get("grid_interval_seconds", interval_seconds)
-    )
-    if not math.isclose(interval_seconds, declared_interval, rel_tol=0, abs_tol=1e-9):
-        raise ValueError("Manifest and split sampling intervals do not match.")
+    if require_regular:
+        interval_seconds = _regular_interval_seconds(combined.index)
+        declared_interval = float(
+            manifest.get("grid_audit", {}).get("grid_interval_seconds", interval_seconds)
+        )
+        if not math.isclose(interval_seconds, declared_interval, rel_tol=0, abs_tol=1e-9):
+            raise ValueError("Manifest and split sampling intervals do not match.")
     return splits, manifest, run_dir
 
 
@@ -215,6 +217,7 @@ def time_features(
     index: pd.DatetimeIndex,
     sampling_interval_seconds: float | None = None,
     maximum_supported_seconds: float | None = None,
+    encoding: str = "bounded_log_interval_v1",
 ) -> np.ndarray:
     if sampling_interval_seconds is None:
         sampling_interval_seconds = _regular_interval_seconds(index)
@@ -232,9 +235,18 @@ def time_features(
         + second_of_day / 86_400.0
     )
     seasonal_phase = 2.0 * np.pi * fractional_day_of_year / 365.2425
+    if not np.isfinite(sampling_interval_seconds) or sampling_interval_seconds <= 0:
+        raise ValueError("Sampling interval must be finite and positive.")
+    if encoding == "bounded_log_interval_v1":
+        log_interval = np.log1p(sampling_interval_seconds)
+        encoded_interval = log_interval / (1.0 + log_interval)
+    elif encoding == "legacy_log_ratio":
+        encoded_interval = np.log1p(sampling_interval_seconds) / np.log1p(maximum_supported_seconds)
+    else:
+        raise ValueError(f"Unknown temporal encoding: {encoding}")
     interval_feature = np.full(
         len(index),
-        np.log1p(sampling_interval_seconds) / np.log1p(maximum_supported_seconds),
+        encoded_interval,
         dtype="float64",
     )
     return np.stack(
@@ -350,7 +362,9 @@ def make_artificial_missing_mask(
             rate = int(selected_pattern.split("_")[1]) / 100.0
             sample_target[:] = _point_target(sample_observed, rate, rng)
         elif selected_pattern == "temporal_block":
-            block_length = int(rng.integers(max(2, steps // 10), steps // 2 + 1))
+            shortest = max(1, min(steps, max(2, steps // 10)))
+            longest = max(shortest, steps // 2)
+            block_length = int(rng.integers(shortest, longest + 1))
             start = int(rng.integers(0, steps - block_length + 1))
             block_available = np.flatnonzero(
                 sample_observed[start : start + block_length].any(axis=(0, 2))
@@ -438,6 +452,12 @@ def build_model(sensor_count: int, config: Mapping[str, object]) -> ImputeFormer
         dropout=float(config["dropout"]),
         windows=int(config["window"]),
         dim_proj=int(config["dim_proj"]),
+        variable_length=bool(config.get("variable_length", False)),
+        use_interpolation_residual=bool(config.get("use_interpolation_residual", False)),
+        time_aware=bool(config.get("time_aware", False)),
+        static_sensor_embedding=bool(config.get("static_sensor_embedding", False)),
+        visible_median_calibration=bool(config.get("visible_median_calibration", False)),
+        no_context_prior=config.get("no_context_prior"),
     )
 
 
@@ -1015,7 +1035,7 @@ def load_saved_selection(
     return model, history, best_epoch
 
 
-def run(args: argparse.Namespace) -> Path:
+def run_legacy(args: argparse.Namespace) -> Path:
     seed_everything(args.seed)
     splits, dataset_manifest, dataset_run = load_ocean_sensor_splits(
         Path(args.dataset_root), Path(args.dataset_run) if args.dataset_run else None
@@ -1030,6 +1050,7 @@ def run(args: argparse.Namespace) -> Path:
         raise ValueError("Every split must contain at least one full model window.")
 
     output_root = Path(args.output_root).resolve()
+    model_root = Path(args.model_root).resolve()
     if args.resume_selection_run:
         run_dir = Path(args.resume_selection_run).resolve()
         if not run_dir.is_dir():
@@ -1039,17 +1060,25 @@ def run(args: argparse.Namespace) -> Path:
                 "The resumed selection run must be under the configured "
                 "output-root/runs directory."
             )
+        model_run_dir = model_root / "runs" / run_dir.name
+        if not model_run_dir.is_dir():
+            raise FileNotFoundError(
+                f"Selection model directory does not exist: {model_run_dir}"
+            )
     else:
-        run_dir = output_root / "runs" / artifact_timestamp()
+        run_id = artifact_timestamp()
+        run_dir = output_root / "runs" / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
+        model_run_dir = model_root / "runs" / run_id
+        model_run_dir.mkdir(parents=True, exist_ok=False)
     history_path = run_dir / "model_selection_history.csv"
     final_history_path = run_dir / "final_full_dataset_history.csv"
-    best_state_path = run_dir / "best_selection_state.pt"
+    best_state_path = model_run_dir / "best_selection_state.pt"
     metrics_json_path = run_dir / "independent_test_metrics.json"
     metrics_csv_path = run_dir / "independent_test_metrics.csv"
     gate_path = run_dir / "production_qualification.json"
     aligned_path = run_dir / "aligned_ocean_five_sensor_timeseries.parquet"
-    checkpoint_path = run_dir / "imputeformer_ocean_five_sensor.pt"
+    checkpoint_path = model_run_dir / "imputeformer_ocean_five_sensor.pt"
     summary_path = run_dir / "training_summary.json"
     if not args.resume_selection_run:
         _write_json(summary_path, {
@@ -1066,7 +1095,7 @@ def run(args: argparse.Namespace) -> Path:
             gate_path,
             aligned_path,
             checkpoint_path,
-            run_dir / "qualified_selection_candidate.pt",
+            model_run_dir / "qualified_selection_candidate.pt",
         )
         existing = [str(path) for path in protected if path.exists()]
         if existing:
@@ -1249,7 +1278,10 @@ def run(args: argparse.Namespace) -> Path:
         "qualification": gate,
         "held_out_test_metrics_before_full_refit": metrics_document,
     }
-    torch.save(candidate_checkpoint, run_dir / "qualified_selection_candidate.pt")
+    torch.save(
+        candidate_checkpoint,
+        model_run_dir / "qualified_selection_candidate.pt",
+    )
     if not gate["passed"]:
         summary = {
             "status": "rejected_by_baseline_gate",
@@ -1361,9 +1393,9 @@ def run(args: argparse.Namespace) -> Path:
         },
     }
     torch.save(checkpoint, checkpoint_path)
-    active_checkpoint = output_root / "imputeformer_ocean_five_sensor.pt"
-    temporary_active = output_root / "imputeformer_ocean_five_sensor.pt.tmp"
-    output_root.mkdir(parents=True, exist_ok=True)
+    active_checkpoint = model_root / "imputeformer_ocean_five_sensor.pt"
+    temporary_active = model_root / "imputeformer_ocean_five_sensor.pt.tmp"
+    model_root.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(checkpoint_path, temporary_active)
     temporary_active.replace(active_checkpoint)
 
@@ -1407,93 +1439,62 @@ def run(args: argparse.Namespace) -> Path:
     return active_checkpoint
 
 
+def run(args: argparse.Namespace) -> Path:
+    from train_time_aware_imputeformer import run as run_adaptive
+    from calibrate_time_aware_baseline import calibrate_checkpoint
+    trained = run_adaptive(args)
+    checkpoint = torch.load(trained, map_location="cpu", weights_only=False)
+    if torch.count_nonzero(checkpoint["model_state_dict"]["context_residual_gain"]).item():
+        return Path(args.model_root).resolve() / "imputeformer_ocean_five_sensor.pt"
+    return calibrate_checkpoint(
+        trained, output_root=args.output_root, model_root=args.model_root,
+        device=args.device, repeats=args.evaluation_repeats,
+        batch_size=2, cpu_threads=args.cpu_threads,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train and qualify the second-level five-sensor ImputeFormer."
+        description="Train a fresh variable-length five-sensor ImputeFormer and report held-out baseline comparisons."
     )
     parser.add_argument("--dataset-root", default=str(DEFAULT_DATASET_ROOT))
     parser.add_argument("--dataset-run", default=None)
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
+    parser.add_argument("--model-root", default=str(DEFAULT_MODEL_ROOT))
     parser.add_argument(
-        "--resume-selection-run",
-        default=None,
-        help=(
-            "Existing immutable run whose saved best selection state should be "
-            "qualified and refit without repeating completed selection epochs."
-        ),
+        "--window", type=int, default=3600,
+        help="Maximum training/inference context in rows; not an input-length requirement.",
     )
-    parser.add_argument(
-        "--initial-selection-state",
-        default=None,
-        help="Warm-start a new immutable selection run from a plain model state dict.",
-    )
-    parser.add_argument(
-        "--selection-evaluation-only",
-        action="store_true",
-        help="Evaluate and qualify the initial state without another training epoch.",
-    )
-    parser.add_argument(
-        "--calibrate-output",
-        action="store_true",
-        help="Fit frozen per-sensor affine calibration on validation outages.",
-    )
-    parser.add_argument(
-        "--minimum-calibration-scale",
-        type=float,
-        default=0.10,
-        help="Minimum retained model contribution in validation output calibration.",
-    )
-    parser.add_argument("--window", type=int, default=3600)
-    parser.add_argument("--training-stride", type=int, default=3600)
     parser.add_argument("--inference-stride", type=int, default=1800)
-    parser.add_argument("--batch-size", type=int, default=3)
-    parser.add_argument("--max-epochs", type=int, default=200)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--steps-per-epoch", type=int, default=128,
+        help="Randomly sampled training batches per epoch; does not imply full-row coverage.",
+    )
+    parser.add_argument("--training-lengths", type=int, nargs="+", default=[100, 256, 500, 1000, 2000, 3600])
+    parser.add_argument("--sampling-intervals-seconds", type=float, nargs="+", default=[1, 2, 5, 10, 30, 60, 300, 3600])
+    parser.add_argument("--batch-row-budget", type=int, default=4096)
+    parser.add_argument("--evaluation-repeats", type=int, default=2)
+    parser.add_argument("--cpu-threads", type=int, default=4)
+    parser.add_argument("--max-epochs", type=int, default=100)
     parser.add_argument("--min-epochs", type=int, default=30)
-    parser.add_argument("--patience", type=int, default=30)
-    parser.add_argument(
-        "--training-mask-pattern",
-        choices=("mixed", *MASK_PATTERNS),
-        default="mixed",
-    )
-    parser.add_argument(
-        "--validation-mask-pattern",
-        choices=("mixed", *MASK_PATTERNS),
-        default="mixed",
-    )
-    parser.add_argument(
-        "--final-training-mask-pattern",
-        choices=("mixed", *MASK_PATTERNS),
-        default="mixed",
-    )
-    parser.add_argument(
-        "--final-finetune-epochs",
-        type=int,
-        default=None,
-        help=(
-            "Fine-tune the qualified selection state on the complete timeline for "
-            "this many epochs instead of a random re-fit for selected_epochs."
-        ),
-    )
+    parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--min-delta", type=float, default=1e-4)
-    parser.add_argument("--minimum-relative-improvement", type=float, default=0.0)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--grad-clip", type=float, default=5.0)
-    parser.add_argument("--fil-alpha", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--input-embedding-dim", type=int, default=32)
-    parser.add_argument("--learnable-embedding-dim", type=int, default=96)
-    parser.add_argument("--feed-forward-dim", type=int, default=256)
+    parser.add_argument("--learnable-embedding-dim", type=int, default=32)
+    parser.add_argument("--feed-forward-dim", type=int, default=128)
     parser.add_argument("--num-temporal-heads", type=int, default=4)
-    parser.add_argument("--num-layers", type=int, default=3)
+    parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--dim-proj", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.1)
     args = parser.parse_args()
     if args.window < 2:
         parser.error("window must be at least 2")
-    if not 1 <= args.training_stride <= args.window:
-        parser.error("training-stride must be between 1 and window")
     if not 1 <= args.inference_stride <= args.window:
         parser.error("inference-stride must be between 1 and window")
     if args.max_epochs < 1 or args.min_epochs < 1:
@@ -1502,12 +1503,31 @@ def parse_args() -> argparse.Namespace:
         parser.error("min-epochs cannot exceed max-epochs")
     if args.patience < 1:
         parser.error("patience must be positive")
-    if args.final_finetune_epochs is not None and args.final_finetune_epochs < 1:
-        parser.error("final-finetune-epochs must be positive")
-    if not 0.0 < args.minimum_calibration_scale <= 1.0:
-        parser.error("minimum-calibration-scale must be in (0, 1]")
-    if not 0 <= args.minimum_relative_improvement < 1:
-        parser.error("minimum-relative-improvement must be in [0, 1)")
+    for name in (
+        "batch_size", "steps_per_epoch",
+        "cpu_threads", "input_embedding_dim", "learnable_embedding_dim",
+        "feed_forward_dim", "num_temporal_heads", "num_layers", "dim_proj",
+    ):
+        if getattr(args, name) < 1:
+            parser.error(f"{name.replace('_', '-')} must be positive")
+    if any(length < 1 or length > args.window for length in args.training_lengths):
+        parser.error("training-lengths must be positive and no larger than window")
+    if any(not math.isfinite(s) or s <= 0 for s in args.sampling_intervals_seconds):
+        parser.error("sampling-intervals-seconds must be finite and positive")
+    if args.batch_row_budget < 1 or args.evaluation_repeats < 1:
+        parser.error("batch-row-budget and evaluation-repeats must be positive")
+    if (args.input_embedding_dim + args.learnable_embedding_dim) % args.num_temporal_heads:
+        parser.error("combined embedding dimensions must be divisible by num-temporal-heads")
+    if not math.isfinite(args.lr) or args.lr <= 0:
+        parser.error("lr must be finite and positive")
+    if not math.isfinite(args.grad_clip) or args.grad_clip <= 0:
+        parser.error("grad-clip must be finite and positive")
+    if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
+        parser.error("weight-decay must be finite and nonnegative")
+    if not math.isfinite(args.min_delta) or args.min_delta < 0:
+        parser.error("min-delta must be finite and nonnegative")
+    if not 0 <= args.dropout < 1:
+        parser.error("dropout must be in [0, 1)")
     return args
 
 

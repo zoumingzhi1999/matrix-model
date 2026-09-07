@@ -2,11 +2,39 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime
+import logging
+import os
 from pathlib import Path
 import shutil
 import uuid
 
 import pandas as pd
+
+
+def configure_inference_logging() -> None:
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
+    )
+
+
+def log_feature_frame(
+    logger: logging.Logger,
+    stage: str,
+    modality: str,
+    frame: pd.DataFrame,
+    path: Path,
+) -> None:
+    """Log every feature row and column without pandas display truncation."""
+    logger.info(
+        "%s output modality=%s rows=%d columns=%d artifact=%s\n%s",
+        stage,
+        modality,
+        len(frame),
+        len(frame.columns),
+        path.resolve(),
+        frame.to_csv(index=False, lineterminator="\n"),
+    )
 
 
 def artifact_timestamp() -> str:

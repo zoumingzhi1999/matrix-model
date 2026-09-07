@@ -136,6 +136,14 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _portable_project_path(path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(ROOT.resolve()))
+    except ValueError:
+        return str(resolved)
+
+
 def run(args):
     device = torch.device(
         "cuda"
@@ -193,10 +201,10 @@ def run(args):
             "each target-modality row is reconstructed through CLS while every "
             "other modality is represented by its current-split mean"
         ),
-        "fusion_checkpoint": str(checkpoint_path),
+        "fusion_checkpoint": _portable_project_path(checkpoint_path),
         "fusion_checkpoint_sha256": checkpoint_hash,
         "runtime_weight_renormalization": False,
-        "three_modality_data_root": str(feature_root.parent),
+        "three_modality_data_root": _portable_project_path(feature_root.parent),
     })
     config.pop("public_data_root", None)
     config["modalities"] = {

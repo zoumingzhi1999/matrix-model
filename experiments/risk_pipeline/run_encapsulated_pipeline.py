@@ -1,15 +1,19 @@
 import argparse
 import hashlib
 import json
+import logging
 import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
-from PIL import Image
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "experiments"))
+
+from config.input_paths import resolve_input_paths
 
 from multisource_unified import (
     FUSION_FEATURE_COLUMNS,
@@ -19,13 +23,20 @@ from multisource_unified import (
 from risk_pipeline.artifacts import (
     artifact_path,
     artifact_timestamp,
+    configure_inference_logging,
     copy_file_once,
     latest_file,
-    mapping_to_long_frame,
+    log_feature_frame,
     write_csv_once,
     write_text_once,
 )
-from risk_pipeline.data_io import load_aligned_sensors, load_grayscale_image
+from risk_pipeline.data_io import (
+    load_aligned_sensors,
+    load_grayscale_image,
+    load_sonar_tiff_image,
+    resolve_image_source_paths,
+    resolve_sonar_source_paths,
+)
 from risk_pipeline.modality_features import (
     extract_image_tile_first_stage_features,
 )
@@ -47,7 +58,74 @@ from risk_pipeline.xtf_io import load_xtf_sonar_image
 DEFAULT_RISK_CONFIG = (
     Path(__file__).resolve().parents[2] / "config" / "fixed_single_feature_risk_config.json"
 )
+logger = logging.getLogger("f-model.pipeline")
+
+
+def extract_image_source_features(paths, modality, *, allow_xtf=False):
+    """Extract every source sequentially, retaining tile identity in one table."""
+    frames = []
+    for index, source_path in enumerate(paths, start=1):
+        logger.info(
+            "Image source started: modality=%s file=%d/%d source=%s",
+            modality, index, len(paths), source_path,
+        )
+        if modality == "sonar_image" and allow_xtf and source_path.suffix.lower() == ".xtf":
+            logger.info("Decoding sonar XTF in memory: sonar_source=%s", source_path)
+            image, decode_metadata = load_xtf_sonar_image(source_path)
+        else:
+            logger.info("Loading %s in memory: source=%s", modality, source_path)
+            image = (
+                load_sonar_tiff_image(source_path)
+                if modality == "sonar_image" else load_grayscale_image(source_path)
+            )
+            decode_metadata = {
+                "source_type": "image",
+                "format": source_path.suffix.lower().lstrip("."),
+                "output_height": int(image.shape[0]),
+                "output_width": int(image.shape[1]),
+                "resize_applied": False,
+            }
+        logger.info(
+            "Image decoding complete: modality=%s source=%s shape=%s metadata=%s",
+            modality, source_path, image.shape,
+            json.dumps(decode_metadata, ensure_ascii=False),
+        )
+        frame = extract_image_tile_first_stage_features(
+            source_path.name, image, modality=modality,
+        )
+        frames.append(frame)
+        logger.info(
+            "Image source completed: modality=%s file=%d/%d source=%s feature_rows=%d",
+            modality, index, len(paths), source_path, len(frame),
+        )
+        del image
+    if not frames:
+        raise ValueError(f"No {modality} sources were provided.")
+    combined = pd.concat(frames, ignore_index=True)
+    logger.info(
+        "Image features aggregated: modality=%s source_files=%d feature_rows=%d",
+        modality, len(paths), len(combined),
+    )
+    return combined
+
+
 def run(args, model_bundle: ProductionModelBundle | None = None):
+    configure_inference_logging()
+    input_paths = resolve_input_paths(
+        optical_image=getattr(args, "optical_image", None),
+        sonar_image=getattr(args, "sonar_image", None),
+        sonar_xtf=getattr(args, "sonar_xtf", None),
+    )
+    if input_paths.optical_image is None or input_paths.sonar_source is None:
+        raise ValueError(
+            "Provide an optical image and a sonar TIFF image, "
+            "or set OPTICAL_IMAGE_INPUT_PATH and SONAR_IMAGE_INPUT_PATH in config/input_paths.py."
+        )
+    optical_source_path = input_paths.optical_image
+    sonar_source_path = input_paths.sonar_source
+    optical_sources = resolve_image_source_paths(optical_source_path)
+    allow_xtf = input_paths.sonar_xtf is not None
+    sonar_sources = resolve_sonar_source_paths(sonar_source_path, allow_xtf=allow_xtf)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = getattr(args, "artifact_timestamp", None) or artifact_timestamp()
@@ -58,6 +136,14 @@ def run(args, model_bundle: ProductionModelBundle | None = None):
             imputeformer_output.parent, "aligned", "stage1_imputeformer_aligned_output_*.csv")
         if latest_aligned is not None:
             imputeformer_output = latest_aligned
+    logger.info(
+        "Representation inference started: aligned_time_series=%s optical_image=%s "
+        "sonar_source=%s output_dir=%s",
+        imputeformer_output.resolve(),
+        optical_source_path,
+        sonar_source_path,
+        output_dir.resolve(),
+    )
     aligned_sensors = load_aligned_sensors(str(imputeformer_output))
     aligned_dir = output_dir / "aligned"
     if imputeformer_output.resolve().parent == aligned_dir.resolve():
@@ -67,48 +153,20 @@ def run(args, model_bundle: ProductionModelBundle | None = None):
             output_dir, "aligned", "stage1_imputeformer_aligned_output", ".csv", timestamp)
         copy_file_once(imputeformer_output, retained_imputeformer)
 
+    logger.info("First-stage extraction started: time_series rows=%d", len(aligned_sensors))
     time_first_stage, sensor_ids = extract_first_stage_features(aligned_sensors)
     time_first_stage_path = artifact_path(
         output_dir, "features", "stage2a_time_series_first_stage_features", ".csv", timestamp)
     write_csv_once(time_first_stage, time_first_stage_path)
-
-    optical_source_path = Path(args.optical_image)
-    sonar_source_path = Path(args.sonar_xtf)
-    retained_optical = artifact_path(
-        output_dir, "inputs", "stage0_optical_image", optical_source_path.suffix, timestamp)
-    retained_sonar_xtf = artifact_path(
-        output_dir, "inputs", "stage0_sonar_source", ".xtf", timestamp)
-    copy_file_once(optical_source_path, retained_optical)
-    copy_file_once(sonar_source_path, retained_sonar_xtf)
-
-    optical_image = load_grayscale_image(optical_source_path)
-    sonar_image, sonar_decode_metadata = load_xtf_sonar_image(sonar_source_path)
-    sonar_array_path = artifact_path(
-        output_dir, "decoded", "stage1_xtf_sonar_intensity", ".npy", timestamp)
-    with sonar_array_path.open("xb") as stream:
-        np.save(stream, sonar_image, allow_pickle=False)
-    sonar_preview_path = artifact_path(
-        output_dir, "decoded", "stage1_xtf_sonar_preview", ".png", timestamp)
-    with sonar_preview_path.open("xb") as stream:
-        Image.fromarray(np.rint(sonar_image * 255.0).astype("uint8")).save(
-            stream,
-            format="PNG",
-        )
-    sonar_metadata_path = artifact_path(
-        output_dir, "decoded", "stage1_xtf_decode_metadata", ".csv", timestamp)
-    write_csv_once(
-        mapping_to_long_frame(sonar_decode_metadata),
-        sonar_metadata_path,
+    log_feature_frame(
+        logger, "First-stage features", "time_series", time_first_stage,
+        time_first_stage_path,
     )
-    optical_first_stage = extract_image_tile_first_stage_features(
-        optical_source_path.name,
-        optical_image,
-        modality="optical_image",
-    )
-    sonar_first_stage = extract_image_tile_first_stage_features(
-        sonar_source_path.name,
-        sonar_image,
-        modality="sonar_image",
+
+    logger.info("First-stage extraction started: optical_image and sonar_image")
+    optical_first_stage = extract_image_source_features(optical_sources, "optical_image")
+    sonar_first_stage = extract_image_source_features(
+        sonar_sources, "sonar_image", allow_xtf=allow_xtf,
     )
     optical_first_stage_path = artifact_path(
         output_dir, "features", "stage2b_optical_image_first_stage_features", ".csv", timestamp)
@@ -116,37 +174,36 @@ def run(args, model_bundle: ProductionModelBundle | None = None):
         output_dir, "features", "stage2c_sonar_image_first_stage_features", ".csv", timestamp)
     write_csv_once(optical_first_stage, optical_first_stage_path)
     write_csv_once(sonar_first_stage, sonar_first_stage_path)
+    log_feature_frame(
+        logger, "First-stage features", "optical_image", optical_first_stage,
+        optical_first_stage_path,
+    )
+    log_feature_frame(
+        logger, "First-stage features", "sonar_image", sonar_first_stage,
+        sonar_first_stage_path,
+    )
 
+    logger.info("Second-stage Transformer extraction started: sensor_count=%d", len(sensor_ids))
     (
-        transformer_features,
+        _,
+        reconstructed_risk_features,
+        _,
+        _,
+        _,
         second_stage_features,
-        token_ranges,
-        concatenated_vectors,
-        feature_positions,
     ) = run_transformer_stage(
         time_first_stage=time_first_stage,
         optical_first_stage=optical_first_stage,
         sonar_first_stage=sonar_first_stage,
         args=args,
         model_bundle=model_bundle,
+        include_row_embeddings=True,
     )
-    concatenated_path = artifact_path(
-        output_dir, "features", "stage3_concatenated_first_stage_vectors", ".csv", timestamp)
-    write_csv_once(concatenated_vectors, concatenated_path)
-    feature_positions_path = artifact_path(
-        output_dir, "features", "stage3_concatenated_feature_positions", ".csv", timestamp)
-    write_csv_once(feature_positions, feature_positions_path)
-    transformer_path = artifact_path(
-        output_dir, "features", "stage3_transformer_unified_features", ".csv", timestamp)
-    write_csv_once(transformer_features, transformer_path)
-    token_ranges_path = artifact_path(
-        output_dir, "features", "stage3_transformer_token_ranges", ".csv", timestamp)
-    write_csv_once(token_ranges, token_ranges_path)
     second_stage_paths = {}
     second_stage_stems = {
-        "time_series": "stage3a_time_series_second_stage_features",
-        "optical_image": "stage3b_optical_image_second_stage_features",
-        "sonar_image": "stage3c_sonar_image_second_stage_features",
+        "time_series": "stage3a_time_series_second_stage_unified_128d",
+        "optical_image": "stage3b_optical_image_second_stage_unified_128d",
+        "sonar_image": "stage3c_sonar_image_second_stage_unified_128d",
     }
     for modality in FUSION_MODALITIES:
         path = artifact_path(
@@ -158,6 +215,10 @@ def run(args, model_bundle: ProductionModelBundle | None = None):
         )
         write_csv_once(second_stage_features[modality], path)
         second_stage_paths[modality] = path
+        log_feature_frame(
+            logger, "Second-stage features", modality,
+            second_stage_features[modality], path,
+        )
     fusion_checkpoint_path = (
         model_bundle.fusion_checkpoint_path
         if model_bundle is not None
@@ -169,25 +230,20 @@ def run(args, model_bundle: ProductionModelBundle | None = None):
     risk_config_path = Path(getattr(args, "risk_config", DEFAULT_RISK_CONFIG))
     risk_config = load_fixed_risk_config(risk_config_path)
     validate_risk_checkpoint_binding(risk_config, fusion_checkpoint_path)
+    logger.info(
+        "Risk calculation started: fusion_checkpoint=%s risk_config=%s",
+        fusion_checkpoint_path, risk_config_path.resolve(),
+    )
 
     selected_vectors, feature_risk_matrix, overall_risk_matrix = (
         build_second_stage_feature_risk_matrices(
-            second_stage_features,
+            reconstructed_risk_features,
             risk_config,
         )
     )
 
-    selected_vectors_path = artifact_path(
-        output_dir,
-        "risk_inputs",
-        "selected_second_stage_feature_vectors",
-        ".csv",
-        timestamp,
-    )
-    write_csv_once(selected_vectors, selected_vectors_path)
-
     modality_sources = {
-        modality: second_stage_paths[modality].name
+        modality: second_stage_paths[modality].relative_to(output_dir).as_posix()
         for modality in FUSION_MODALITIES
     }
     modality_risk_result = feature_risk_matrix[[
@@ -221,8 +277,10 @@ def run(args, model_bundle: ProductionModelBundle | None = None):
     checkpoint_sha256 = _file_sha256(fusion_checkpoint_path)
     risk_config_sha256 = _file_sha256(risk_config_path)
     risk_result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "artifact_timestamp": timestamp,
+        "second_stage_feature_stage": "stage3_transformer_unified_embedding",
+        "embedding_dimension": 128,
         "risk_feature_stage": "stage3_transformer_unified_reconstruction",
         "fusion_checkpoint_sha256": checkpoint_sha256,
         "risk_config_sha256": risk_config_sha256,
@@ -234,9 +292,14 @@ def run(args, model_bundle: ProductionModelBundle | None = None):
                 "concatenated_index": int(row.concatenated_index),
                 "transformer_token_index": int(row.transformer_token_index),
                 "source": str(row.source),
-                "selected_vector_artifact": str(
-                    selected_vectors_path.relative_to(output_dir)
-                ).replace("\\", "/"),
+                "source_representation": "transformer_fused_cls",
+                "source_feature_columns": "z_000..z_127",
+                "source_context": "target_modality_row_with_other_modality_means",
+                "risk_cls_token_index": 0,
+                "transformer_token_index_role": "input_modality_token",
+                "risk_feature_derivation": (
+                    "unified_decoder_then_inverse_normalization_then_selected_feature"
+                ),
                 "vector_length": int(row.vector_length),
                 "feature_value_summary": {
                     "min": float(
@@ -280,77 +343,28 @@ def run(args, model_bundle: ProductionModelBundle | None = None):
         json.dumps(risk_result, indent=2, ensure_ascii=False) + "\n",
     )
 
-    summary = {
-        "artifact_timestamp": timestamp,
-        "stage1_imputeformer_output": str(retained_imputeformer),
-        "stage0_optical_image_input": str(retained_optical),
-        "stage0_sonar_xtf_input": str(retained_sonar_xtf),
-        "stage1_xtf_sonar_intensity": str(sonar_array_path),
-        "stage1_xtf_sonar_preview": str(sonar_preview_path),
-        "stage1_xtf_decode_metadata": str(sonar_metadata_path),
-        "stage2a_time_series_first_stage_features": str(time_first_stage_path),
-        "stage2b_optical_image_first_stage_features": str(optical_first_stage_path),
-        "stage2c_sonar_image_first_stage_features": str(sonar_first_stage_path),
-        "stage3_concatenated_first_stage_vectors": str(concatenated_path),
-        "stage3_concatenated_feature_positions": str(feature_positions_path),
-        "stage3_transformer_features": str(transformer_path),
-        "stage3_transformer_token_ranges": str(token_ranges_path),
-        "stage3_second_stage_features": {
-            modality: str(second_stage_paths[modality])
-            for modality in FUSION_MODALITIES
-        },
-        "stage3_feature_fusion_checkpoint": str(fusion_checkpoint_path),
-        "stage3_feature_fusion_checkpoint_sha256": checkpoint_sha256,
-        "selected_second_stage_feature_vectors": str(selected_vectors_path),
-        "risk_matrix": str(risk_json_path),
-        "final_risk": final_risk,
-        "risk_level": final_risk_level,
-        "fixed_risk_config": str(risk_config_path.resolve()),
-        "fixed_risk_config_sha256": risk_config_sha256,
-        "sensor_count": len(sensor_ids),
-        "selected_features": {
-            name: spec["selected_feature"]
-            for name, spec in risk_config["modalities"].items()
-        },
-        "risk_feature_stage": "stage3_transformer_unified_reconstruction",
-        "second_stage_context_policy": (
-            "reconstruct every target-modality row through the CLS fusion vector; "
-            "represent each other modality by the mean of all its current rows"
-        ),
-        "fixed_weights": {
-            name: spec["fixed_weight"]
-            for name, spec in risk_config["modalities"].items()
-        },
-        "note": (
-            "Second-stage Transformer input is strictly the output of "
-            "first-stage feature extraction for each modality. Raw time-series, "
-            "optical and XTF-decoded sonar arrays are not directly fed into the "
-            "second-stage Transformer. The CLS fusion representation is decoded back "
-            "to named, original-unit second-stage features while preserving every "
-            "sensor and image-tile input. Operational risk reads exactly "
-            "one named second-stage feature per modality and applies frozen weights "
-            "without runtime renormalization. Optical and sonar inputs keep their "
-            "original resolution, are split into 128x128 overlapping tiles with a "
-            "nominal 64-pixel stride, and are summarized by averaging all calibrated "
-            "tile probabilities. At 1920x1080 this produces 464 tiles. "
-            "The three modality risks and final risk are written together in one "
-            "JSON result; risk-matrix CSV files are not produced. "
-            "The Transformer is loaded from the trained production checkpoint, "
-            "has no risk head; it changes the feature values supplied to the fixed "
-            "risk formula but never predicts risk itself. Sonar input is required "
-            "to be raw XTF and is decoded with pyxtf without image resizing."
-        ),
-    }
-    summary_path = artifact_path(
-        output_dir, "summaries", "pipeline_summary", ".csv", timestamp)
-    write_csv_once(mapping_to_long_frame(summary), summary_path)
-
-    print(json.dumps(risk_result, indent=2, ensure_ascii=False))
+    logger.info(
+        "Risk calculation complete: risk_matrix=%s result=%s",
+        risk_json_path.resolve(), json.dumps(risk_result, ensure_ascii=False),
+    )
+    if getattr(args, "print_result", True):
+        print(json.dumps(risk_result, indent=2, ensure_ascii=False))
 
     return {
         "risk_result": risk_result,
         "risk_json_path": risk_json_path,
-        "summary_path": summary_path,
+        "artifacts": {
+            "aligned": str(retained_imputeformer),
+            "first_stage_features": {
+                "time_series": str(time_first_stage_path),
+                "optical_image": str(optical_first_stage_path),
+                "sonar_image": str(sonar_first_stage_path),
+            },
+            "second_stage_features": {
+                modality: str(path) for modality, path in second_stage_paths.items()
+            },
+            "risk_matrix": str(risk_json_path),
+        },
     }
 
 
@@ -384,12 +398,30 @@ def reconstruct_second_stage_features(
     feature_frames,
     batch_size=8192,
 ):
-    """Decode each source row through a fused CLS representation.
+    """Return named decoder features for the existing risk calibration contract."""
+    _, reconstructed = encode_second_stage_features(
+        model, normalization, feature_frames, batch_size,
+        include_embeddings=False,
+    )
+    return reconstructed
+
+
+def encode_second_stage_features(
+    model,
+    normalization,
+    feature_frames,
+    batch_size=8192,
+    *,
+    include_embeddings=True,
+):
+    """Return fused CLS vectors and named risk-decoder values from the same pass.
 
     The target modality keeps its original row granularity. Other modalities
     contribute their current-table mean, which avoids an arbitrary Cartesian
     product while ensuring every decoded row is cross-modal.
     """
+    if batch_size < 1:
+        raise ValueError("Second-stage batch_size must be positive.")
     normalized_values = {}
     for modality in FUSION_MODALITIES:
         frame = feature_frames[modality]
@@ -413,10 +445,17 @@ def reconstruct_second_stage_features(
         modality: values.mean(axis=0, keepdims=True)
         for modality, values in normalized_values.items()
     }
-    second_stage_features = {}
+    unified_features = {}
+    reconstructed_features = {}
     for target_modality in FUSION_MODALITIES:
         target_values = normalized_values[target_modality]
+        logger.info(
+            "Second-stage Transformer encoding modality=%s rows=%d embedding_dim=%d "
+            "representation=fused_cls device=%s batch_size=%d",
+            target_modality, len(target_values), model.d_model, device, batch_size,
+        )
         reconstructed_batches = []
+        unified_batches = []
         for start in range(0, len(target_values), batch_size):
             end = min(start + batch_size, len(target_values))
             current_batch_size = end - start
@@ -430,10 +469,11 @@ def reconstruct_second_stage_features(
                     )
                 batch_inputs[modality] = torch.from_numpy(batch_values).to(device)
             with torch.inference_mode():
-                reconstructed = model(batch_inputs)["unified_reconstruction"][
-                    target_modality
-                ]
+                output = model(batch_inputs)
+                reconstructed = output["unified_reconstruction"][target_modality]
             reconstructed_batches.append(reconstructed.cpu().numpy())
+            if include_embeddings:
+                unified_batches.append(output["unified"].cpu().numpy())
 
         reconstructed_normalized = np.concatenate(reconstructed_batches, axis=0)
         mean = np.asarray(normalization[target_modality]["mean"], dtype="float32")
@@ -444,11 +484,20 @@ def reconstruct_second_stage_features(
         metadata_columns = [
             column for column in source_frame.columns if column not in feature_columns
         ]
-        reconstructed_frame = source_frame.loc[:, metadata_columns].reset_index(drop=True)
+        row_metadata = source_frame.loc[:, metadata_columns].reset_index(drop=True)
+        if include_embeddings:
+            vectors = np.concatenate(unified_batches, axis=0)
+            if vectors.shape != (len(source_frame), model.d_model) or not np.isfinite(vectors).all():
+                raise ValueError(f"Invalid unified Transformer vectors for {target_modality}.")
+            vector_frame = pd.DataFrame(
+                vectors, columns=[f"z_{index:03d}" for index in range(model.d_model)],
+            )
+            unified_features[target_modality] = pd.concat([row_metadata, vector_frame], axis=1)
+        reconstructed_frame = row_metadata.copy()
         for column_index, column in enumerate(feature_columns):
             reconstructed_frame[column] = reconstructed_original_units[:, column_index]
-        second_stage_features[target_modality] = reconstructed_frame
-    return second_stage_features
+        reconstructed_features[target_modality] = reconstructed_frame
+    return unified_features, reconstructed_features
 
 
 def run_transformer_stage(
@@ -457,6 +506,8 @@ def run_transformer_stage(
     sonar_first_stage,
     args,
     model_bundle: ProductionModelBundle | None = None,
+    *,
+    include_row_embeddings: bool = False,
 ):
     if model_bundle is None:
         checkpoint_path = Path(
@@ -469,6 +520,11 @@ def run_transformer_stage(
     else:
         model = model_bundle.fusion_model
         checkpoint = model_bundle.fusion_checkpoint
+    if include_row_embeddings and model.d_model != 128:
+        raise ValueError(
+            f"Second-stage output requires a 128-dimensional Transformer checkpoint; "
+            f"got d_model={model.d_model}."
+        )
     normalization = checkpoint["normalization"]
 
     feature_frames = {
@@ -582,19 +638,21 @@ def run_transformer_stage(
                     "context_aggregation": aggregation,
                 })
         concatenated_rows.append(concatenated_row)
-    second_stage_features = reconstruct_second_stage_features(
+    unified_features, second_stage_features = encode_second_stage_features(
         model,
         normalization,
         feature_frames,
+        include_embeddings=include_row_embeddings,
     )
 
-    return (
+    result = (
         pd.DataFrame(rows),
         second_stage_features,
         pd.DataFrame(range_rows),
         pd.DataFrame(concatenated_rows),
         pd.DataFrame(position_rows),
     )
+    return (*result, unified_features) if include_row_embeddings else result
 
 
 def parse_args():
@@ -608,8 +666,10 @@ def parse_args():
         "--output-dir",
         default="outputs/encapsulated_alignment_representation_pipeline",
     )
-    parser.add_argument("--optical-image", default="data/public_multisource_images/optical_image.jpg")
-    parser.add_argument("--sonar-xtf", required=True, help="Raw sonar XTF file.")
+    parser.add_argument("--optical-image", help="Optical image or directory; overrides OPTICAL_IMAGE_INPUT_PATH.")
+    sonar = parser.add_mutually_exclusive_group()
+    sonar.add_argument("--sonar-image", help="Sonar TIFF (.tif/.tiff) file or directory; overrides configured sonar input.")
+    sonar.add_argument("--sonar-xtf", help="Legacy raw sonar XTF input; overrides configured sonar input.")
     parser.add_argument("--risk-config", default=str(DEFAULT_RISK_CONFIG))
     parser.add_argument(
         "--fusion-checkpoint",

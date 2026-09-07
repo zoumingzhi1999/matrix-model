@@ -1,5 +1,5 @@
 [project]
-name = "feature-model"
+name = "f-model"
 version = "0.1.0"
 description = "Mobile-cable three-modality feature fusion and fixed-weight risk service"
 requires-python = ">=3.11"
@@ -17,3 +17,6 @@ dependencies = [
     "torch>=2.6",
     "uvicorn>=0.34",
 ]
+
+[project.optional-dependencies]
+ocean-data = ["pydap>=3.5"]

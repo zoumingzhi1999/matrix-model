@@ -1,1 +1,1 @@
-"""Backend HTTP service for the feature-model risk pipeline."""
+"""Backend HTTP service for the F-Model risk pipeline."""

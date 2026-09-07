@@ -45,6 +45,7 @@ from multisource_unified import (  # noqa: E402
 
 
 DEFAULT_OUTPUT_DIR = ROOT / "outputs" / "feature_fusion_transformer_production"
+DEFAULT_MODEL_DIR = ROOT / "models" / "feature_fusion_transformer"
 CHECKPOINT_NAME = "feature_fusion_transformer.pt"
 LABELS = (0, 1)
 
@@ -910,10 +911,12 @@ def run(args: argparse.Namespace) -> Path:
 
     feature_root = Path(args.feature_root)
     output_root = Path(args.output_dir)
+    model_root = Path(args.model_dir)
     output_root.mkdir(parents=True, exist_ok=True)
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     output_dir = output_root / "runs" / run_id
     output_dir.mkdir(parents=True, exist_ok=False)
+    model_dir = model_root / "runs" / run_id
 
     raw_corpus, data_manifest = load_raw_corpus(feature_root)
     normalization = fit_normalization(raw_corpus)
@@ -1035,7 +1038,8 @@ def run(args: argparse.Namespace) -> Path:
         "independent_test": test_pairing,
     }
 
-    checkpoint_path = output_dir / CHECKPOINT_NAME
+    model_dir.mkdir(parents=True, exist_ok=False)
+    checkpoint_path = model_dir / CHECKPOINT_NAME
     checkpoint = {
         "schema_version": 1,
         "model_class": "FeatureFusionTransformer",
@@ -1109,7 +1113,8 @@ def run(args: argparse.Namespace) -> Path:
         data_manifest,
         args,
     )
-    active_checkpoint = output_root / CHECKPOINT_NAME
+    model_root.mkdir(parents=True, exist_ok=True)
+    active_checkpoint = model_root / CHECKPOINT_NAME
     temporary_active = active_checkpoint.with_suffix(".pt.tmp")
     shutil.copyfile(checkpoint_path, temporary_active)
     temporary_active.replace(active_checkpoint)
@@ -1138,6 +1143,7 @@ def parse_args() -> argparse.Namespace:
         help="Feature directory from one immutable three-modality preparation run.",
     )
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
+    parser.add_argument("--model-dir", default=str(DEFAULT_MODEL_DIR))
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epochs", type=int, default=200)

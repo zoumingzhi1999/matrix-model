@@ -55,9 +55,13 @@ Desktop.ini
 *.tmp
 *.temp
 
-# Downloaded/prepared datasets and generated model artifacts
+# Downloaded/prepared datasets and generated artifacts
 /data/
 /outputs/
+/models/**/*.pt
+/models/**/*.pth
+/models/**/*.ckpt
+/models/**/*.safetensors
 
 # Local working copies
 /feature-model - 副本/

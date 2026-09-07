@@ -92,7 +92,7 @@
   "risk_profile": "mobile-cable underwater sensing risk",
   "calibration_feature_stage": "stage3_transformer_unified_reconstruction",
   "calibration_context_policy": "each target-modality row is reconstructed through CLS while every other modality is represented by its current-split mean",
-  "fusion_checkpoint": "D:\\Matrix-model\\feature-model - 副本\\outputs\\feature_fusion_transformer_production\\feature_fusion_transformer.pt",
+  "fusion_checkpoint": "models\\feature_fusion_transformer\\feature_fusion_transformer.pt",
   "fusion_checkpoint_sha256": "fcaaac006112a4b8572613b5cfcdb404c144af4481644f91e581d9f4adf0fbd8",
-  "three_modality_data_root": "D:\\Matrix-model\\feature-model - 副本\\data\\multimodal_training\\runs\\20260906_021327_023277"
+  "three_modality_data_root": "data\\multimodal_training\\runs\\20260906_021327_023277"
 }
