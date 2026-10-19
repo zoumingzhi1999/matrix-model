@@ -21,11 +21,15 @@ embedded in the trained checkpoint. There is no site or coordinate entity.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
+import shutil
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -60,6 +64,45 @@ logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
 )
+
+
+# 跨机部署（back 在云端、模型在内网机）时，back 传过来的是模型主机读不到的绝对路径。
+# 约定：以 http:// 或 https:// 开头即视为远端资源，先下载到本地缓存再用。
+REMOTE_ASSET_CACHE_DIR = ROOT / "outputs" / "remote_assets"
+REMOTE_ASSET_TIMEOUT_SECONDS = float(os.environ.get("REMOTE_ASSET_TIMEOUT_SECONDS", "600"))
+
+
+def _materialize_remote_source(value: Optional[str], cache_dir: Path) -> Optional[str]:
+    """把 http(s) URL 下载到本地缓存目录并返回本地路径；非 URL 原样返回。
+
+    缓存键为 URL 的 sha1 前 16 位 + 原扩展名，因此同一个 URL 只会下载一次。
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text.lower().startswith(("http://", "https://")):
+        return value
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(urllib.parse.urlparse(text).path).suffix
+    key = hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+    target = cache_dir / f"{key}{suffix}"
+    if target.exists() and target.stat().st_size > 0:
+        logger.info("Remote asset cache hit: %s -> %s", text, target)
+        return str(target)
+
+    partial = cache_dir / f"{key}{suffix}.part"
+    logger.info("Downloading remote asset: %s", text)
+    try:
+        with urllib.request.urlopen(text, timeout=REMOTE_ASSET_TIMEOUT_SECONDS) as response:
+            with open(partial, "wb") as handle:
+                shutil.copyfileobj(response, handle, length=1024 * 1024)
+        partial.replace(target)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    logger.info("Remote asset ready: %s (%s bytes)", target, target.stat().st_size)
+    return str(target)
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +261,8 @@ def create_app(
         ),
     )
     jobs_root.mkdir(parents=True, exist_ok=True)
+    remote_cache_root = REMOTE_ASSET_CACHE_DIR
+    remote_cache_root.mkdir(parents=True, exist_ok=True)
     model_bundle_holder = {"value": model_bundle}
     model_load_lock = threading.Lock()
     completed_jobs: Dict[str, Path] = {}
@@ -327,10 +372,10 @@ def create_app(
 
         buf = registry.get(req.buffer_key)
         paths = resolve_input_paths(
-            time_series=req.time_series_input,
-            optical_image=req.optical_image,
-            sonar_xtf=req.sonar_xtf,
-            sonar_image=req.sonar_image,
+            time_series=_materialize_remote_source(req.time_series_input, remote_cache_root),
+            optical_image=_materialize_remote_source(req.optical_image, remote_cache_root),
+            sonar_xtf=_materialize_remote_source(req.sonar_xtf, remote_cache_root),
+            sonar_image=_materialize_remote_source(req.sonar_image, remote_cache_root),
         )
         read_from_file = req.time_series_input is not None or (
             len(buf) == 0 and paths.time_series is not None

@@ -93,6 +93,6 @@
   "calibration_feature_stage": "stage3_transformer_unified_reconstruction",
   "calibration_context_policy": "each target-modality row is reconstructed through CLS while every other modality is represented by its current-split mean",
   "fusion_checkpoint": "models\\feature_fusion_transformer\\feature_fusion_transformer.pt",
-  "fusion_checkpoint_sha256": "fcaaac006112a4b8572613b5cfcdb404c144af4481644f91e581d9f4adf0fbd8",
+  "fusion_checkpoint_sha256": "35eedc9b9438947470a8a22696e44eeb49d30d66db86a820bf22efadc4d96b32",
   "three_modality_data_root": "data\\multimodal_training\\runs\\20260906_021327_023277"
 }
